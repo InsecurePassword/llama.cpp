@@ -1649,6 +1649,37 @@ static void ggml_backend_sched_prefetch_store_layout(
     sched->prefetch_slot_initialized[slot] = true;
 }
 
+static bool ggml_backend_sched_prefetch_init_slot_tensor(
+        ggml_backend_sched_t sched, int slot, ggml_tensor * tensor) {
+    ggml_backend_buffer_t buffer = sched->prefetch_slots[slot];
+    if (ggml_backend_buffer_init_tensor(buffer, tensor) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+
+    const size_t tensor_size = ggml_nbytes(tensor);
+    const size_t alloc_size = ggml_backend_buffer_get_alloc_size(buffer, tensor);
+    if (alloc_size > tensor_size) {
+        const size_t padding_size = alloc_size - tensor_size;
+        GGML_ASSERT(padding_size <= INT64_MAX);
+
+        struct ggml_tensor padding = {};
+        padding.type = GGML_TYPE_I8;
+        padding.buffer = buffer;
+        padding.ne[0] = (int64_t) padding_size;
+        padding.ne[1] = 1;
+        padding.ne[2] = 1;
+        padding.ne[3] = 1;
+        padding.nb[0] = ggml_type_size(padding.type);
+        padding.nb[1] = padding.nb[0] * padding.ne[0];
+        padding.nb[2] = padding.nb[1];
+        padding.nb[3] = padding.nb[2];
+        padding.data = (char *) tensor->data + tensor_size;
+        ggml_backend_tensor_memset(&padding, 0, 0, padding_size);
+    }
+
+    return true;
+}
+
 static void ggml_backend_sched_prefetch_release_slots(
         ggml_backend_sched_t sched, ggml_backend_t split_backend, int first) {
     first = std::max(first, 0);
@@ -1896,8 +1927,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                             bool initialized = true;
                             if (!same_layout) {
-                                initialized = ggml_backend_buffer_init_tensor(
-                                        sched->prefetch_slots[slot], input_cpy) == GGML_STATUS_SUCCESS;
+                                initialized = ggml_backend_sched_prefetch_init_slot_tensor(
+                                        sched, slot, input_cpy);
                                 if (initialized) {
                                     ggml_backend_sched_prefetch_store_layout(sched, slot, input_cpy);
                                 }
