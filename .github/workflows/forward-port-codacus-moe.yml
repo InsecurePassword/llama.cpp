@@ -6,9 +6,6 @@ on:
       - moe-prefetch-forward-port
     paths:
       - .github/workflows/forward-port-codacus-moe.yml
-  pull_request:
-    branches:
-      - master
 
 permissions:
   contents: write
@@ -108,11 +105,10 @@ jobs:
           -DLLAMA_BUILD_SERVER=OFF
           -DBUILD_SHARED_LIBS=OFF
 
-      - name: Compile minimal build
-        run: cmake --build build --parallel 2
+      - name: Compile targeted benchmark
+        run: cmake --build build --target llama-bench --parallel 2
 
       - name: Commit forward-port
-        if: github.event_name == 'push'
         run: |
           git add \
             docs/development/moe-offload-prefetch.md \
