@@ -1,0 +1,114 @@
+name: Forward-port thecodacus MoE optimizations
+
+on:
+  push:
+    branches:
+      - moe-prefetch-forward-port
+    paths:
+      - .github/workflows/forward-port-codacus-moe.yml
+
+permissions:
+  contents: write
+
+jobs:
+  port:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out current upstream-based branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch source commits
+        run: |
+          git remote add thecodacus https://github.com/thecodacus/llama.cpp.git
+          git fetch --no-tags thecodacus \
+            20f5994bfeb91d24da328077c4b6095998cc9888 \
+            1163cb34939fe4a9cb07aec034c5954144497ae9 \
+            5f83fbbe7c668c59912a1fe09e86a0ef580406c4 \
+            5e7f6271c06b9104862ab799278a1b7f1323a449
+
+      - name: Attempt ordered cherry-pick without committing
+        id: port
+        shell: bash
+        run: |
+          set +e
+          mkdir -p port-diagnostics/patches port-diagnostics/conflicts
+
+          commits=(
+            20f5994bfeb91d24da328077c4b6095998cc9888
+            1163cb34939fe4a9cb07aec034c5954144497ae9
+            5f83fbbe7c668c59912a1fe09e86a0ef580406c4
+            5e7f6271c06b9104862ab799278a1b7f1323a449
+          )
+
+          for sha in "${commits[@]}"; do
+            git show --format=fuller --binary "$sha" > "port-diagnostics/patches/${sha}.patch"
+            echo "Applying $sha" | tee -a port-diagnostics/apply.log
+            git cherry-pick --no-commit "$sha" >> port-diagnostics/apply.log 2>&1
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "conflict=1" >> "$GITHUB_OUTPUT"
+              echo "$sha" > port-diagnostics/failed-commit.txt
+              git status --short > port-diagnostics/status-short.txt
+              git status > port-diagnostics/status.txt
+              git ls-files -u > port-diagnostics/unmerged-index.txt
+              git diff --cc > port-diagnostics/conflict.diff
+              git diff > port-diagnostics/worktree.diff
+              git diff --cached > port-diagnostics/index.diff
+
+              while IFS= read -r file; do
+                [ -n "$file" ] || continue
+                mkdir -p "port-diagnostics/conflicts/$(dirname "$file")"
+                cp "$file" "port-diagnostics/conflicts/$file"
+              done < <(git diff --name-only --diff-filter=U)
+
+              exit 0
+            fi
+          done
+
+          echo "conflict=0" >> "$GITHUB_OUTPUT"
+          git diff --check
+          git status --short > port-diagnostics/status-short.txt
+          git diff --binary > port-diagnostics/forward-port.diff
+
+      - name: Upload conflict diagnostics
+        if: steps.port.outputs.conflict == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codacus-moe-port-conflicts
+          path: port-diagnostics
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Stop on unresolved conflicts
+        if: steps.port.outputs.conflict == '1'
+        run: exit 1
+
+      - name: Configure minimal build
+        if: steps.port.outputs.conflict == '0'
+        run: >-
+          cmake -S . -B build
+          -DLLAMA_CURL=OFF
+          -DGGML_NATIVE=OFF
+          -DLLAMA_BUILD_TESTS=OFF
+          -DLLAMA_BUILD_EXAMPLES=OFF
+          -DLLAMA_BUILD_SERVER=OFF
+
+      - name: Compile minimal build
+        if: steps.port.outputs.conflict == '0'
+        run: cmake --build build --parallel 2
+
+      - name: Commit forward-port
+        if: steps.port.outputs.conflict == '0'
+        run: |
+          git add README.md ggml/src/ggml-backend.cpp src/llama-mmap.cpp src/llama-mmap.h src/llama-model-loader.cpp
+          git commit -m "ggml: forward-port MoE expert prefetch optimizations"
+          git push origin HEAD:moe-prefetch-forward-port
