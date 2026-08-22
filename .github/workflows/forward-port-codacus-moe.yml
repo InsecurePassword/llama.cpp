@@ -6,6 +6,9 @@ on:
       - moe-prefetch-forward-port
     paths:
       - .github/workflows/forward-port-codacus-moe.yml
+  pull_request:
+    branches:
+      - master
 
 permissions:
   contents: write
@@ -19,6 +22,7 @@ jobs:
       - name: Check out current upstream-based branch
         uses: actions/checkout@v4
         with:
+          ref: moe-prefetch-forward-port
           fetch-depth: 0
 
       - name: Configure Git identity
@@ -107,7 +111,7 @@ jobs:
         run: cmake --build build --parallel 2
 
       - name: Commit forward-port
-        if: steps.port.outputs.conflict == '0'
+        if: steps.port.outputs.conflict == '0' && github.event_name == 'push'
         run: |
           git add README.md ggml/src/ggml-backend.cpp src/llama-mmap.cpp src/llama-mmap.h src/llama-model-loader.cpp
           git commit -m "ggml: forward-port MoE expert prefetch optimizations"
