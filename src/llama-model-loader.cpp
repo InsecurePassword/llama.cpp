@@ -11,6 +11,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <future>
 #include <regex>
 
@@ -1688,14 +1689,37 @@ bool llama_model_loader::load_all_data(
     if (size_done >= size_data) {
         // unmap offloaded tensors and metadata
         if (use_mmap) {
-            // pin the pages backing the weights kept in system memory for faster H2D copies
+            // Use a complete CUDA provider pair from one backend registry.
+            const bool register_host_requested = getenv("GGML_CUDA_REGISTER_HOST") != nullptr;
             bool (*reg_fn)(void *, size_t) = nullptr;
             void (*unreg_fn)(void *) = nullptr;
-            for (size_t i = 0; i < ggml_backend_dev_count() && !reg_fn; i++) {
-                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_dev_get(i));
-                reg_fn   = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
-                unreg_fn = (void (*)(void *))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+            const char * reg_provider = nullptr;
+            if (register_host_requested) {
+                for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                    ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                    if (strncmp(ggml_backend_dev_name(dev), "CUDA", 4) != 0) {
+                        continue;
+                    }
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    auto reg_candidate = (bool (*)(void *, size_t))
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
+                    auto unreg_candidate = (void (*)(void *))
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+                    if (reg_candidate != nullptr && unreg_candidate != nullptr) {
+                        reg_fn = reg_candidate;
+                        unreg_fn = unreg_candidate;
+                        reg_provider = ggml_backend_dev_name(dev);
+                        break;
+                    }
+                }
+                if (reg_fn == nullptr) {
+                    LLAMA_LOG_WARN("%s: host registration was requested but no complete CUDA provider was found\n",
+                            __func__);
+                }
             }
+
+            size_t registered_total = 0;
+            bool registration_failed = false;
 
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
@@ -1704,12 +1728,21 @@ bool llama_model_loader::load_all_data(
                 if (mmap_used.second != 0) {
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
-                if (mmap_used.second > mmap_used.first) {
-                    size_t n_registered = mapping->register_host(mmap_used.first, mmap_used.second, reg_fn, unreg_fn);
-                    if (n_registered > 0) {
-                        LLAMA_LOG_INFO("%s: pinned %.2f MiB of mapped model memory for faster H2D transfers\n",
-                                __func__, n_registered / 1024.0 / 1024.0);
-                    }
+                if (register_host_requested && reg_fn != nullptr && mmap_used.second > mmap_used.first) {
+                    size_t n_registered = mapping->register_host(
+                            mmap_used.first, mmap_used.second, reg_fn, unreg_fn);
+                    registered_total += n_registered;
+                    registration_failed |= n_registered == 0;
+                }
+            }
+            if (register_host_requested && reg_fn != nullptr) {
+                if (registered_total > 0) {
+                    LLAMA_LOG_INFO("%s: pinned %.2f MiB of mapped model memory with %s\n",
+                            __func__, registered_total / 1024.0 / 1024.0, reg_provider);
+                }
+                if (registration_failed || registered_total == 0) {
+                    LLAMA_LOG_WARN("%s: mapped host registration did not cover every retained model range\n",
+                            __func__);
                 }
             }
         }
