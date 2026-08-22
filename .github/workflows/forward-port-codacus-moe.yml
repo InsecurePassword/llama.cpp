@@ -1,11 +1,9 @@
 name: Forward-port thecodacus MoE optimizations
 
 on:
-  push:
+  pull_request:
     branches:
-      - moe-prefetch-forward-port
-    paths:
-      - .github/workflows/forward-port-codacus-moe.yml
+      - master
 
 permissions:
   contents: write
