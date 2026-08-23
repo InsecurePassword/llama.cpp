@@ -1,0 +1,172 @@
+name: Package Linux CUDA build
+
+on:
+  push:
+    branches:
+      - build-linux-cuda-package
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            cmake \
+            g++ \
+            gcc \
+            git \
+            libgomp1 \
+            libssl-dev \
+            ninja-build \
+            patchelf \
+            tar \
+            xz-utils
+
+      - name: Check out exact merged source
+        uses: actions/checkout@v6
+        with:
+          ref: 795525fda9ae06474ca99b3ccda3cdb8c92a3ccc
+          fetch-depth: 1
+
+      - name: Configure CUDA release build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES='75-real;86-real;89-real;120-real;120-virtual' \
+            -DGGML_CUDA=ON \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DBUILD_SHARED_LIBS=ON
+
+      - name: Build useful targets
+        run: |
+          cmake --build build --parallel 2 --target \
+            llama-cli \
+            llama-server \
+            llama-bench \
+            llama-quantize \
+            llama-tokenize
+
+      - name: Assemble portable package
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG=llama-cpp-moe-linux-x86_64-cuda12.8-rtx20-50
+          mkdir -p "dist/$PKG/bin" "dist/$PKG/lib"
+
+          cp build/bin/llama-cli "dist/$PKG/bin/"
+          cp build/bin/llama-server "dist/$PKG/bin/"
+          cp build/bin/llama-bench "dist/$PKG/bin/"
+          cp build/bin/llama-quantize "dist/$PKG/bin/"
+          cp build/bin/llama-tokenize "dist/$PKG/bin/"
+
+          find build -type f \( -name 'libllama.so*' -o -name 'libggml.so*' -o -name 'libggml-base.so*' -o -name 'libggml-cpu.so*' -o -name 'libggml-cuda.so*' \) \
+            -exec cp -a {} "dist/$PKG/lib/" \;
+
+          # Remove duplicate library copies while preserving soname links if present.
+          find "dist/$PKG/lib" -maxdepth 1 -type f -printf '%f\n' | sort -u > "dist/$PKG/LIBRARIES.txt"
+
+          for exe in "dist/$PKG/bin/"*; do
+            patchelf --set-rpath '$ORIGIN/../lib' "$exe"
+          done
+          for so in "dist/$PKG/lib/"*.so*; do
+            [ -e "$so" ] || continue
+            patchelf --set-rpath '$ORIGIN' "$so" || true
+          done
+
+          cat > "dist/$PKG/README.txt" <<'EOF'
+          llama.cpp MoE-prefetch Linux CUDA build
+          ======================================
+
+          Source repository: https://github.com/InsecurePassword/llama.cpp
+          Source commit: 795525fda9ae06474ca99b3ccda3cdb8c92a3ccc
+          Platform: x86-64 Linux
+          Build environment: Ubuntu 22.04 / CUDA Toolkit 12.8.1
+          CUDA GPU code: sm_75, sm_86, sm_89, sm_120, plus compute_120 PTX
+
+          Intended consumer GPUs:
+            RTX 20-series: sm_75
+            RTX 30-series: sm_86
+            RTX 40-series: sm_89
+            RTX 50-series: sm_120
+
+          Requirements:
+            - Ubuntu/Kubuntu 22.04 or newer is recommended.
+            - A sufficiently recent proprietary NVIDIA driver is required.
+            - CUDA runtime/cuBLAS libraries compatible with CUDA 12.x may be required by libggml-cuda.so.
+              Check DEPENDENCIES.txt after extraction. If libcudart.so.12 or libcublas.so.12 is
+              reported missing on the target, install the matching NVIDIA CUDA 12 runtime libraries.
+
+          Run binaries directly from bin/. Their RPATH points to ../lib for llama.cpp/ggml libraries.
+
+          MoE prefetch controls added by this fork:
+            GGML_SCHED_PREFETCH_EXPERTS=1   default 3 staging slots
+            GGML_SCHED_PREFETCH_EXPERTS=N   request N slots (2-8 useful)
+            GGML_CUDA_REGISTER_HOST=1       POSIX mmap host-registration path
+
+          Example:
+            export GGML_SCHED_PREFETCH_EXPERTS=1
+            ./bin/llama-cli -m /path/model.gguf -ngl all -ncmoe 26
+          EOF
+
+          {
+            echo '=== SOURCE ==='
+            echo '795525fda9ae06474ca99b3ccda3cdb8c92a3ccc'
+            echo
+            echo '=== NVCC ==='
+            nvcc --version
+            echo
+            echo '=== BINARY DEPENDENCIES ==='
+            for exe in "dist/$PKG/bin/"*; do
+              echo "--- $(basename "$exe") ---"
+              ldd "$exe" || true
+            done
+            echo
+            echo '=== CUDA BACKEND DEPENDENCIES ==='
+            for so in "dist/$PKG/lib/"libggml-cuda.so*; do
+              [ -e "$so" ] || continue
+              echo "--- $(basename "$so") ---"
+              ldd "$so" || true
+            done
+          } > "dist/$PKG/DEPENDENCIES.txt"
+
+          (cd "dist/$PKG" && sha256sum bin/* lib/* > SHA256SUMS.txt)
+          tar -C dist -cJf "dist/$PKG.tar.xz" "$PKG"
+          sha256sum "dist/$PKG.tar.xz" > "dist/$PKG.tar.xz.sha256"
+
+      - name: Sanity-check packaged executables
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG=llama-cpp-moe-linux-x86_64-cuda12.8-rtx20-50
+          export LD_LIBRARY_PATH="$PWD/dist/$PKG/lib:${LD_LIBRARY_PATH:-}"
+          dist/$PKG/bin/llama-cli --version
+          dist/$PKG/bin/llama-server --version
+          dist/$PKG/bin/llama-bench --help >/dev/null
+          dist/$PKG/bin/llama-quantize --help >/dev/null || true
+          dist/$PKG/bin/llama-tokenize --help >/dev/null
+
+      - name: Upload Linux CUDA package
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-cpp-moe-linux-x86_64-cuda12.8-rtx20-50
+          path: |
+            dist/llama-cpp-moe-linux-x86_64-cuda12.8-rtx20-50.tar.xz
+            dist/llama-cpp-moe-linux-x86_64-cuda12.8-rtx20-50.tar.xz.sha256
+          if-no-files-found: error
+          retention-days: 14
