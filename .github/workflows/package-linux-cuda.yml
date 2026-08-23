@@ -45,11 +45,34 @@ jobs:
           ref: 795525fda9ae06474ca99b3ccda3cdb8c92a3ccc
           fetch-depth: 1
 
+      - name: Configure CUDA driver stub for link-only CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          if [ -d /usr/local/cuda/lib64/stubs ]; then
+            CUDA_STUB_DIR=/usr/local/cuda/lib64/stubs
+          elif [ -d /usr/local/cuda/targets/x86_64-linux/lib/stubs ]; then
+            CUDA_STUB_DIR=/usr/local/cuda/targets/x86_64-linux/lib/stubs
+          else
+            echo 'CUDA driver stub directory was not found' >&2
+            exit 1
+          fi
+
+          test -f "$CUDA_STUB_DIR/libcuda.so"
+          ln -sf libcuda.so "$CUDA_STUB_DIR/libcuda.so.1"
+          echo "CUDA_STUB_DIR=$CUDA_STUB_DIR" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$CUDA_STUB_DIR:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "Link-only CUDA stub: $CUDA_STUB_DIR"
+
       - name: Configure CUDA release build
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_ARCHITECTURES='75-real;86-real;89-real;120-real;120-virtual' \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,$CUDA_STUB_DIR -L$CUDA_STUB_DIR" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath-link,$CUDA_STUB_DIR -L$CUDA_STUB_DIR" \
             -DGGML_CUDA=ON \
             -DGGML_NATIVE=OFF \
             -DLLAMA_CURL=OFF \
@@ -80,7 +103,7 @@ jobs:
           cp build/bin/llama-quantize "dist/$PKG/bin/"
           cp build/bin/llama-tokenize "dist/$PKG/bin/"
 
-          find build -type f \( -name 'libllama.so*' -o -name 'libggml.so*' -o -name 'libggml-base.so*' -o -name 'libggml-cpu.so*' -o -name 'libggml-cuda.so*' \) \
+          find build -type f \( -name 'libllama.so*' -o -name 'libllama-common.so*' -o -name 'libllama-quantize-impl.so*' -o -name 'libggml.so*' -o -name 'libggml-base.so*' -o -name 'libggml-cpu.so*' -o -name 'libggml-cuda.so*' \) \
             -exec cp -a {} "dist/$PKG/lib/" \;
 
           find "dist/$PKG/lib" -maxdepth 1 -type f -printf '%f\n' | sort -u > "dist/$PKG/LIBRARIES.txt"
@@ -115,6 +138,7 @@ jobs:
             - CUDA runtime/cuBLAS libraries compatible with CUDA 12.x may be required by libggml-cuda.so.
               Check DEPENDENCIES.txt after extraction. If libcudart.so.12 or libcublas.so.12 is
               reported missing on the target, install the matching NVIDIA CUDA 12 runtime libraries.
+            - libcuda.so.1 must come from the installed NVIDIA driver. The CI-only CUDA stub is not packaged.
 
           Run binaries directly from bin/. Their RPATH points to ../lib for llama.cpp/ggml libraries.
 
@@ -135,17 +159,17 @@ jobs:
             echo '=== NVCC ==='
             nvcc --version
             echo
-            echo '=== BINARY DEPENDENCIES ==='
+            echo '=== BINARY DEPENDENCIES (CI stub supplied only for inspection) ==='
             for exe in "dist/$PKG/bin/"*; do
               echo "--- $(basename "$exe") ---"
-              ldd "$exe" || true
+              LD_LIBRARY_PATH="$CUDA_STUB_DIR:$PWD/dist/$PKG/lib:${LD_LIBRARY_PATH:-}" ldd "$exe" || true
             done
             echo
             echo '=== CUDA BACKEND DEPENDENCIES ==='
             for so in "dist/$PKG/lib/"libggml-cuda.so*; do
               [ -e "$so" ] || continue
               echo "--- $(basename "$so") ---"
-              ldd "$so" || true
+              LD_LIBRARY_PATH="$CUDA_STUB_DIR:$PWD/dist/$PKG/lib:${LD_LIBRARY_PATH:-}" ldd "$so" || true
             done
           } > "dist/$PKG/DEPENDENCIES.txt"
 
@@ -158,7 +182,7 @@ jobs:
         run: |
           set -euo pipefail
           PKG=llama-cpp-moe-linux-x86_64-cuda12.8-rtx20-50
-          export LD_LIBRARY_PATH="$PWD/dist/$PKG/lib:${LD_LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="$CUDA_STUB_DIR:$PWD/dist/$PKG/lib:${LD_LIBRARY_PATH:-}"
           dist/$PKG/bin/llama-cli --version
           dist/$PKG/bin/llama-server --version
           dist/$PKG/bin/llama-bench --help >/dev/null
