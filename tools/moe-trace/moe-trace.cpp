@@ -9,8 +9,8 @@
 // separate prefill routing from decode routing.
 //
 // Usage:
-//   MOE_TRACE_OUT=trace.csv llama-moe-trace -m model.gguf -ngl 99 -ncmoe 26 -fa on \
-//       -p "prompt text" -n 512
+//   MOE_TRACE_OUT=trace.csv llama-moe-trace -m model.gguf -ngl 99 -ncmoe 26
+//       -fa on -p "prompt text" -n 512
 
 #include "arg.h"
 #include "common.h"

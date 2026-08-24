@@ -779,7 +779,7 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
-// async execution of CPU splits (GGML_SCHED_ASYNC_CPU): a persistent worker
+// Async execution of CPU splits: a persistent worker
 // computes a CPU split while the main thread keeps launching later splits that
 // do not depend on it, so an independent GPU split overlaps the CPU compute
 struct ggml_sched_cpu_async {
@@ -919,7 +919,7 @@ struct ggml_backend_sched {
     size_t prefetch_slot_nb[GGML_SCHED_MAX_PREFETCH_SLOTS][GGML_MAX_DIMS];
     int prefetch_cur;
 
-    // async CPU split execution (GGML_SCHED_ASYNC_CPU); NULL when disabled
+    // Async CPU split execution; NULL when disabled.
     struct ggml_sched_cpu_async * cpu_async;
 
     int debug;
@@ -1955,37 +1955,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_backend_buffer_t prefetch_saved_buffer = NULL;
         void * prefetch_saved_data = NULL;
 
-        // an async CPU split may still be computing; join before anything that
-// depends on it: another CPU split, or a split reading a CPU tensor.
-// When the immediately preceding CPU split is independent, preserve the
-// intended cold-CPU/hot-GPU overlap and do not apply the generic
-// zero-input backend-transition synchronization below.
-bool cpu_async_overlap = false;
-if (sched->cpu_async && sched->cpu_async->pending) {
-    bool must_join = split_backend_id == sched->n_backends - 1;
-    for (int input_id = 0; !must_join && input_id < split->n_inputs; input_id++) {
-        ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
-        must_join = input_backend == sched->backends[sched->n_backends - 1];
-    }
-    if (must_join) {
-        enum ggml_status ec = sched->cpu_async->join();
-        if (ec != GGML_STATUS_SUCCESS) {
-            return ec;
+        // An async CPU split may still be computing. Join before another CPU
+        // split or any split that reads a CPU-resident input.
+        if (sched->cpu_async && sched->cpu_async->pending) {
+            bool must_join = split_backend_id == sched->n_backends - 1;
+            for (int input_id = 0; !must_join && input_id < split->n_inputs; input_id++) {
+                ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+                must_join = input_backend == sched->backends[sched->n_backends - 1];
+            }
+            if (must_join) {
+                enum ggml_status ec = sched->cpu_async->join();
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
+            }
         }
-    } else {
-        cpu_async_overlap = prev_backend_id == sched->n_backends - 1;
-    }
-}
 
-// ensure the previous split's async work has completed before we start
-// this split, the allocator may have reused buffer regions across splits
-if (!cpu_async_overlap && split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-    if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-        ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
-    } else {
-        ggml_backend_synchronize(sched->backends[prev_backend_id]);
-    }
-}
+        // Ensure the previous main-thread backend's asynchronous work has
+        // completed before a zero-input transition. An asynchronously launched
+        // CPU split deliberately does not replace prev_backend_id, allowing the
+        // following independent hot GPU split to overlap it.
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(sched->backends[prev_backend_id]);
+            }
+        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -2132,8 +2128,13 @@ if (!cpu_async_overlap && split->n_inputs == 0 && prev_backend_id >= 0 && prev_b
                     };
 
                     int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+                    while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
                         id++;
+                    }
+                    if (id == n_expert) {
+                        // Every routed slot belongs to the opposite hot/cold pack. The
+                        // MUL_MAT_ID skip path emits zeros and does not read this tensor.
+                        continue;
                     }
                     int32_t first_id = id;
                     int32_t last_id = first_id;
@@ -2175,6 +2176,9 @@ if (!cpu_async_overlap && split->n_inputs == 0 && prev_backend_id >= 0 && prev_b
                 // run the CPU split on the worker; the loop continues launching
                 // later splits until one depends on this split's outputs
                 sched->cpu_async->launch(split_backend, &split->graph);
+                // Keep prev_backend_id at the last main-thread backend. The next
+                // independent GPU split can then launch without serializing on the
+                // CPU worker; any actual CPU dependency is joined above.
                 continue;
             }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -2322,7 +2326,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
             GGML_LOG_WARN("%s: MoE expert prefetch was requested but operation offload is disabled\n", __func__);
         }
     }
-
 
     ggml_backend_sched_reset(sched);
 
