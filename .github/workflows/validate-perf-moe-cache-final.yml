@@ -1,0 +1,227 @@
+name: Validate final perf MoE cache port
+
+on:
+  push:
+    branches:
+      - validate-thecodacus-perf-moe-cache
+    paths:
+      - '.github/workflows/validate-perf-moe-cache-final.yml'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - port-thecodacus-perf-moe-cache
+    paths:
+      - '.github/workflows/validate-perf-moe-cache-final.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-perf-moe-cache-final
+  cancel-in-progress: true
+
+env:
+  PORT_HEAD: 76a1b1722849455b4c31cbff8a836b5ee28ed703
+
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out exact port head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PORT_HEAD }}
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build libssl-dev python3
+
+      - name: Check diff and Python tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PORT_HEAD"
+          git diff --check 795525fda9ae06474ca99b3ccda3cdb8c92a3ccc..HEAD
+          python3 -m py_compile tools/moe-trace/simulate.py
+          cat > "$RUNNER_TEMP/moe-trace.csv" <<'EOF'
+          -2,0,0,1
+          -1,0,0,2
+          0,0,0,1
+          1,0,2,3
+          2,0,0,3
+          3,0,1,2
+          EOF
+          python3 tools/moe-trace/simulate.py "$RUNNER_TEMP/moe-trace.csv" --budgets 0.25,0.5 --reelect 2 > "$RUNNER_TEMP/simulate.out"
+          grep -q '^trace:' "$RUNNER_TEMP/simulate.out"
+          grep -q 'st-oracle' "$RUNNER_TEMP/simulate.out"
+
+      - name: Configure targeted CPU build
+        run: |
+          cmake -S . -B build-cpu -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DBUILD_SHARED_LIBS=OFF
+
+      - name: Build affected targets
+        run: |
+          cmake --build build-cpu --parallel 2 --target \
+            llama-cli \
+            llama-server \
+            llama-bench \
+            llama-moe-trace \
+            test-backend-ops
+
+      - name: Run targeted CPU tests and CLI smoke checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          build-cpu/bin/test-backend-ops test -b CPU -o MUL_MAT_ID -j 2 | tee "$RUNNER_TEMP/test-backend-ops.log"
+          grep -Eq '[0-9]+/[0-9]+ tests passed' "$RUNNER_TEMP/test-backend-ops.log"
+          build-cpu/bin/llama-cli --version
+          build-cpu/bin/llama-server --version
+          build-cpu/bin/llama-bench --help | grep -q -- '--sched-async-cpu'
+          build-cpu/bin/llama-cli --help | grep -q -- '--moe-cache-profile'
+          build-cpu/bin/llama-cli --help | grep -q -- '--moe-cache-slots'
+          build-cpu/bin/llama-moe-trace --help >/dev/null
+
+  cuda-compile:
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential cmake git libssl-dev ninja-build python3
+
+      - name: Check out exact port head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PORT_HEAD }}
+          fetch-depth: 1
+
+      - name: Configure CUDA build
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$PORT_HEAD"
+          export LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}"
+          cmake -S . -B build-cuda -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES='89-real;120-real;120-virtual' \
+            -DCMAKE_EXE_LINKER_FLAGS='-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs -Wl,--allow-shlib-undefined' \
+            -DCMAKE_SHARED_LINKER_FLAGS='-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs -Wl,--allow-shlib-undefined' \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_CUB_3DOT2=ON \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DBUILD_SHARED_LIBS=ON
+
+      - name: Compile affected CUDA targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}"
+          cmake --build build-cuda --parallel 2 --target \
+            llama-cli \
+            llama-server \
+            llama-bench \
+            llama-moe-trace \
+            test-backend-ops
+
+      - name: Inspect Linux CUDA artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x build-cuda/bin/llama-cli
+          test -x build-cuda/bin/llama-server
+          test -x build-cuda/bin/llama-bench
+          test -x build-cuda/bin/llama-moe-trace
+          test -x build-cuda/bin/test-backend-ops
+          test -e build-cuda/bin/libggml-cuda.so
+          ldd build-cuda/bin/libggml-cuda.so || true
+
+  windows-cuda-compile:
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out exact port head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PORT_HEAD }}
+          fetch-depth: 1
+
+      - name: Install CUDA Toolkit 12.8.1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda_12.8.1_windows_network.exe'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://developer.download.nvidia.com/compute/cuda/12.8.1/network_installers/cuda_12.8.1_windows_network.exe' -OutFile $installer
+          $process = Start-Process -FilePath $installer -ArgumentList '-s' -PassThru -Wait
+          if ($process.ExitCode -ne 0) {
+            throw "CUDA installer exited with code $($process.ExitCode)"
+          }
+          $cudaPath = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
+          if (-not (Test-Path (Join-Path $cudaPath 'bin\nvcc.exe'))) {
+            throw "nvcc was not installed at $cudaPath"
+          }
+          "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Configure and compile Windows CUDA targets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse HEAD).Trim() -ne $env:PORT_HEAD) {
+            throw 'Unexpected source revision'
+          }
+          & "$env:CUDA_PATH\bin\nvcc.exe" --version
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) {
+            throw 'Visual Studio 2022 C++ tools were not found'
+          }
+          $devCmd = Join-Path $vsPath 'Common7\Tools\VsDevCmd.bat'
+          $commands = @(
+            "call `"$devCmd`" -arch=x64 -host_arch=x64",
+            "cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER=`"$env:CUDA_PATH\bin\nvcc.exe`" -DCMAKE_CUDA_ARCHITECTURES=120 -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_SERVER=ON -DBUILD_SHARED_LIBS=ON",
+            "cmake --build build-cuda --target llama-cli llama-server llama-bench llama-moe-trace test-backend-ops --parallel 2"
+          ) -join ' && '
+          cmd.exe /d /s /c $commands
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows CUDA build failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Inspect Windows CUDA artifacts
+        shell: pwsh
+        run: |
+          $required = @(
+            'build-cuda\bin\llama-cli.exe',
+            'build-cuda\bin\llama-server.exe',
+            'build-cuda\bin\llama-bench.exe',
+            'build-cuda\bin\llama-moe-trace.exe',
+            'build-cuda\bin\test-backend-ops.exe',
+            'build-cuda\bin\ggml-cuda.dll'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) {
+              throw "Missing expected artifact: $path"
+            }
+          }
