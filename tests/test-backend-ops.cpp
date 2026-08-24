@@ -4649,7 +4649,7 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, bool skip_ids = false, bool all_skip_ids = false) {
     std::random_device rd;
     std::default_random_engine rng(rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
@@ -4662,6 +4662,15 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
                     data[i] = i % n_mats;
                 }
                 std::shuffle(data.begin(), data.end(), rng);
+                if (all_skip_ids) {
+                    std::fill(data.begin(), data.end(), -1);
+                } else if (skip_ids) {
+                    // id == -1 marks "expert not owned by this pack" (hot/cold
+                    // expert split); keep slot 0 valid for mixed-id coverage.
+                    for (int i = 1; i < t->ne[0]; i += 2) {
+                        data[i] = -1;
+                    }
+                }
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
             }
         } else {
@@ -4680,9 +4689,11 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const bool skip_ids;     // some ids are -1 (hot/cold expert-pack split)
+    const bool all_skip_ids; // every id is -1
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, skip_ids, all_skip_ids);
     }
 
     double max_nmse_err() override {
@@ -4704,10 +4715,12 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32,
+            bool skip_ids = false, bool all_skip_ids = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), skip_ids(skip_ids), all_skip_ids(all_skip_ids) {
             GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(!all_skip_ids || skip_ids);
         }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -4727,12 +4740,17 @@ struct test_mul_mat_id : public test_case {
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
         ggml_set_name(out, "out");
+        if (skip_ids) {
+            // Announce that ids may contain -1 so backends route around
+            // kernels without skip support (mirrors llama's pack nodes).
+            out->op_params[0] = 1;
+        }
 
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats);
+        init_mul_mat_id_tensors(ctx, n_mats, skip_ids, all_skip_ids);
     }
 };
 
@@ -9151,6 +9169,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
+    // hot/cold expert-pack split: ids may be -1 ("expert not owned by this pack") and the
+    // op must emit zero rows for those slots — cover mmvq (n=1), mmq (n=64), mmf (f16) and
+    // the general fallback across quantized/float types
+    for (ggml_type ta : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 16, 8, false, 256, 1, 256, /*skip_ids=*/true));
+        test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 16, 8, false, 256, 4, 256, /*skip_ids=*/true));
+        test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 16, 8, false, 256, 64, 256, /*skip_ids=*/true));
+        // A batch can route exclusively to the opposite pack. Exercise the
+        // all--1 edge case in the vector and general CUDA dispatch shapes.
+        test_cases.emplace_back(new test_mul_mat_id(
+                ta, GGML_TYPE_F32, 16, 8, false, 256, 1, 256,
+                /*skip_ids=*/true, /*all_skip_ids=*/true));
+        test_cases.emplace_back(new test_mul_mat_id(
+                ta, GGML_TYPE_F32, 16, 8, false, 256, 64, 256,
+                /*skip_ids=*/true, /*all_skip_ids=*/true));
+    }
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
