@@ -1935,8 +1935,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
-    ,
+        selected_experts_in,
         moe_cache);
 }
 
