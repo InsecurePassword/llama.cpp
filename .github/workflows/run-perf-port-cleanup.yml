@@ -1,0 +1,59 @@
+name: Run perf MoE cache port cleanup
+
+on:
+  push:
+    branches:
+      - port-thecodacus-perf-moe-cache
+    paths:
+      - '.github/workflows/run-perf-port-cleanup.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out temporary automation head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply, test, and publish clean port head
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch='port-thecodacus-perf-moe-cache'
+          start_sha='${{ github.sha }}'
+          port_head='dc26b603257564154f3c6629ca23436d9e65edf0'
+          cp .github/cleanup-perf-port.py "$RUNNER_TEMP/cleanup-perf-port.py"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git reset --hard "$port_head"
+          python3 "$RUNNER_TEMP/cleanup-perf-port.py"
+          git diff --check
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build libssl-dev python3
+          cmake -S . -B build-cpu -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=ON \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build build-cpu --parallel 2 --target test-backend-ops llama-moe-trace llama-bench
+          build-cpu/bin/test-backend-ops test -b CPU -o MUL_MAT_ID -j 2
+          python3 -m py_compile tools/moe-trace/simulate.py
+
+          git add ggml/src/ggml-backend.cpp src/llama-graph.cpp tests/test-backend-ops.cpp tools/moe-trace/moe-trace.cpp
+          git commit -m 'fix: harden MoE cache all-skipped routing and clean port' \
+            -m 'Bound the selective expert scan when every cold-pack id is -1, add all-skipped MUL_MAT_ID coverage, preserve current scheduler synchronization semantics, and clean forward-port formatting.' \
+            -m 'Assisted-by: GPT-5.6 Pro'
+          git push --force-with-lease="refs/heads/$branch:$start_sha" origin "HEAD:$branch"
